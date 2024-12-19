@@ -55,5 +55,5 @@ Note that this follows the Pyfits convention.
 # For egg_info test builds to pass, put package imports here.
 
 #    from ..laxwrappers import *
-from _lacosmicx import lacosmicx
-__all__ = ['lacosmicx']
+# Define the public API of the module
+__all__ = ['lacosmicx', 'apply_mask', 'improve_pixel_mask_cython']
