@@ -375,7 +375,7 @@ def lacosmicx(np.ndarray[np.float32_t, ndim=2, mode='c', cast=True] indat,
             raise ValueError("""cleantype must be one of the following values:
                             [median, meanmask, medmask, idw]""")
 
-    return (crmask.astype(np.bool), cleanarr)
+    return (crmask.astype(np.bool_), cleanarr)
 
 
 def updatemask(np.ndarray[np.float32_t, ndim=2, mode='c', cast=True] data,
@@ -623,9 +623,7 @@ cdef void clean_idwinterp(float[:, ::1] cleanarr, bool[:, ::1] crmask,
                             if not (crmask[y, x] or mask[y, x]):
                                 val = val + weights[l, k] * cleanarr[y, x]
                                 wsum = wsum + weights[l, k]
-                    if wsum < 1e-6:
-                        cleanarr[j, i] = backgroundlevel
-                    else:
+                    if wsum > 1e-6:
                         cleanarr[j, i] = val / wsum
 
 
@@ -1354,7 +1352,7 @@ def dilate3(np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] dgrow):
 
     # Allocate the output array here so that Python tracks the memory and will
     # free the memory when we are finished with the output array.
-    output = np.zeros((ny, nx), dtype=np.bool)
+    output = np.zeros((ny, nx), dtype=np.bool_)
 
     cdef uint8_t * dgrowptr = < uint8_t * > np.PyArray_DATA(dgrow)
     cdef uint8_t * outdgrowptr = < uint8_t * > np.PyArray_DATA(output)
@@ -1400,10 +1398,191 @@ def dilate5(np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] ddilate,
 
     # Allocate the output array here so that Python tracks the memory and will
     # free the memory when we are finished with the output array.
-    output = np.zeros((ny, nx), dtype=np.bool)
+    output = np.zeros((ny, nx), dtype=np.bool_)
 
     cdef uint8_t * ddilateptr = < uint8_t * > np.PyArray_DATA(ddilate)
     cdef uint8_t * outddilateptr = < uint8_t * > np.PyArray_DATA(output)
     with nogil:
         PyDilate5(ddilateptr, outddilateptr, niter, nx, ny)
     return output
+
+
+def apply_mask(np.ndarray[np.float32_t, ndim=2, mode='c', cast=True] indat,
+               np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] pixelmask,
+               np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] inmask=None,
+               cleantype='idw', set_background_value=False):
+    """
+    apply_mask(indat, pixelmask, inmask=None, cleantype='idw')\n
+    - meanmask: Masked mean filter
+    - medmask: Masked median filter
+    - idw: Inverse distance weighted interpolation
+    Parameters
+    ----------
+    indat : float numpy array
+        Input data array.
+    pixelmask : boolean numpy array
+        (boolean) array with values of True where
+        there are bad pixel detections.
+    inmask : boolean numpy array, optional
+        Input bad pixel mask. Values of True will be ignored in the
+        cleaning process. Default: None.
+    cleantype : {'median', 'medmask', 'meanmask', 'idw'}, optional
+        Set which clean algorithm is used:\n
+        'median': An umasked 5x5 median filter\n
+        'medmask': A masked 5x5 median filter\n
+        'meanmask': A masked 5x5 mean filter\n
+        'idw': A masked 5x5 inverse distance weighted interpolation\n
+        Default: "meanmask".
+    Returns
+    -------
+    cleanarr : float numpy array
+        The cleaned data array.
+    """
+    # Grab the sizes of the input array
+    cdef int nx = indat.shape[1]
+    cdef int ny = indat.shape[0]
+
+    # Make a copy of the data as the cleanarr that we work on
+    # This guarantees that that the data will be contiguous and makes sure we
+    # don't edit the input data.
+    cleanarr = np.empty((ny, nx), dtype=np.float32)
+    # Set the initial values to those of the data array
+    cleanarr[:, :] = indat[:, :]
+
+    pixmask = np.empty((ny, nx), dtype=np.uint8, order='C')
+    pixmask[:, :] = pixelmask[:, :]
+
+    # Setup the mask
+    if inmask is None:
+        # By default don't mask anything
+        mask = np.zeros((ny, nx), dtype=np.uint8, order='C')
+    else:
+        # Make a copy of the input mask
+        mask = np.empty((ny, nx), dtype=np.uint8, order='C')
+        mask[:, :] = inmask[:, :]
+
+    # Find the saturated stars and add them to the mask
+    # updatemask(np.asarray(cleanarr), np.asarray(mask), satlevel, sepmed)
+
+    if set_background_value:
+        # Find the unmasked pixels to calculate the sky.
+        gooddata = np.zeros(int(nx * ny - np.asarray(mask).sum()),
+                            dtype=np.float32,
+                            order='c')
+
+        gooddata[:] = cleanarr[np.logical_not(mask)]
+
+        # Get the default background level for large cosmic rays.
+        backgroundlevel = median(gooddata, len(gooddata))
+        print ("backgroundlevel: ", backgroundlevel)
+        del gooddata
+    else:
+        backgroundlevel = float('nan')
+
+    # Masked mean filter
+    if cleantype == 'meanmask':
+        clean_meanmask(cleanarr, pixmask, mask, nx, ny, backgroundlevel)
+    # Masked median filter
+    elif cleantype == 'medmask':
+        clean_medmask(cleanarr, pixmask, mask, nx, ny, backgroundlevel)
+    # Inverse distance weighted interpolation
+    elif cleantype == 'idw':
+        clean_idwinterp(cleanarr, pixmask, mask, nx, ny, backgroundlevel)
+    else:
+        raise ValueError("""cleantype must be one of the following values:
+                        [median, meanmask, medmask, idw]""")
+
+    return cleanarr
+
+def improve_pixel_mask_cython(
+        np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] seg_map,
+        np.ndarray[np.uint8_t, ndim=2, mode='c', cast=True] pixel_mask,
+        int search_radius=3
+    ):
+    """
+    Improve a binary pixel mask by setting neighboring pixels of lines in the segmentation map to 1. 
+
+    The function iterates over each pixel in the mask. If a pixel is a line (value is 1), it checks 
+    the neighboring pixels within a specified radius in the segmentation map. If any of these neighboring 
+    pixels is not 0, the corresponding pixel in the pixel mask is set to 1. This is done in two passes, 
+    one from top to bottom and one from bottom to top.
+
+    Parameters
+    ----------
+    seg_map : ndarray
+        A 2D numpy array representing the segmentation map. It should be the same shape as pixel_mask.
+    pixel_mask : ndarray
+        A 2D numpy array representing the pixel mask to be improved. It should be the same shape as seg_map.
+    search_radius : int, optional
+        The radius within which to search for neighboring pixels. The default value is 3.
+
+    Returns
+    -------
+    None
+        The function modifies the pixel_mask array in-place.
+
+    Notes
+    -----
+    The function uses Cython's parallel processing capabilities to speed up the computation. 
+    It does not use Python's global interpreter lock (GIL), which means it is not thread-safe. 
+    It should only be called from a single thread.
+    """
+
+    cdef int nx = seg_map.shape[1]
+    cdef int ny = seg_map.shape[0]
+
+    c_seg_map = np.empty((ny, nx), dtype=np.uint8, order='C')
+    c_seg_map[:, :] = seg_map[:, :]
+
+    c_pixel_mask = np.empty((ny, nx), dtype=np.uint8, order='C')
+    c_pixel_mask[:, :] = pixel_mask[:, :]
+
+    improve_pixel_mask(c_seg_map, c_pixel_mask, search_radius)
+    
+    return c_pixel_mask
+
+cdef void improve_pixel_mask(
+    bool[:, ::1] seg_map, 
+    bool[:, ::1] pixel_mask, 
+    int search_radius=3):
+    
+    cdef int height = seg_map.shape[0]
+    cdef int width = seg_map.shape[1]
+    cdef int i, j, dx, dy, ni, nj
+
+    with nogil, parallel():
+        # Run from top to bottom
+        for i in range(height):
+            for j in range(width):
+                if pixel_mask[i, j] == 1:  # Check if the pixel is a line in the pixel mask
+                    for dx in range(-search_radius, search_radius + 1):
+                        for dy in range(-search_radius, search_radius + 1):
+                            # Skip the center pixel
+                            if dx == 0 and dy == 0:
+                                continue
+                            
+                            ni, nj = i + dx, j + dy
+
+                            # Check if the neighbor coordinates are within the array bounds
+                            if 0 <= ni < height and 0 <= nj < width:
+                                if seg_map[ni, nj] != 0:  # Check if the neighbor pixel in the seg_map is not equal to 0
+                                    pixel_mask[ni, nj] = 1  # Set the corresponding pixel in the pixel_mask to 1
+
+        # Run from bottom to top
+        for i in range(height-1, -1, -1):
+            for j in range(width-1, -1, -1):
+                if pixel_mask[i, j] == 1:  # Check if the pixel is a line in the pixel mask
+                    for dx in range(-search_radius, search_radius + 1):
+                        for dy in range(-search_radius, search_radius + 1):
+                            # Skip the center pixel
+                            if dx == 0 and dy == 0:
+                                continue
+                            
+                            ni, nj = i + dx, j + dy
+
+                            # Check if the neighbor coordinates are within the array bounds
+                            if 0 <= ni < height and 0 <= nj < width:
+                                if seg_map[ni, nj] != 0:  # Check if the neighbor pixel in the seg_map is not equal to 0
+                                    pixel_mask[ni, nj] = 1  # Set the corresponding pixel in the pixel_mask to 1
+
+
